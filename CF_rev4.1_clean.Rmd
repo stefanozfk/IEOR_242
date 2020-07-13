@@ -1,0 +1,366 @@
+---
+title: "Appendix - Collaborative Filtering and Ensemble Model"
+output:
+  pdf_document: default
+  html_document: default
+date: "27/04/2020"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(pracma)
+library("ggmap")
+library(ggplot2)   
+library(jsonlite)
+library(stringr)
+library(tm)
+library(cluster)
+library(SnowballC)
+library(factoextra)
+library(fpc)
+library(maptools)
+library(maps)
+library(dplyr)
+library(caTools)
+```
+
+## LOAD DATA
+
+We will use the 'train_vcuinformation.csv' and  'test_vcuinformation.csv' files that were produced after preprocessing the raw data of the 7 original tables. The resulting csv files are significantly smaller in size than the original tables, we filtered for the most significant users and SKUs. These two csv files are already split into trainig and test subsets.
+
+```{r}
+setwd("/Users/stefanozavagli/Documents/Carrera/Schools/Berkeley/Clases/SPRING '20/IEOR 242/Project/Data/Preprocessed")
+train_vcuinformation <- read.csv(file = 'train_vcuinformation.csv')
+test_vcuinformation <- read.csv(file = 'test_vcuinformation.csv')
+```
+
+## FEATURE DISTRIBUTIONS
+
+```{r}
+pphist <- ggplot(train_vcuinformation, aes(purchase_power)) +
+  geom_histogram() + 
+  ggtitle("Purchasing Power Distribution") +
+  theme(plot.title = element_text(hjust=0.5))
+pphist
+
+ahist <- ggplot(train_vcuinformation, aes(age)) +
+  geom_histogram() +
+  ggtitle("Age Distribution") +
+  theme(plot.title = element_text(hjust=0.5))
+ahist
+```
+
+```{r}
+users_tot_purchase = train_vcuinformation[2:3]
+users_tot_purchase$user_ID = as.numeric(seq(1, length(users_tot_purchase$user_ID)))
+names(users_tot_purchase)[2] = "Total_purchases"
+for (i in 1:dim(users_tot_purchase)[1]) {
+  users_tot_purchase[i, 2] = sum(train_vcuinformation[i, 11:70])
+}
+```
+
+```{r}
+tphist <- ggplot(users_tot_purchase, aes(Total_purchases)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="gray", bins = 60) +
+  xlim(5, 25) + 
+  geom_density(alpha=0.5, fill="#FF6666") +
+  geom_vline(aes(xintercept=mean(Total_purchases)), color="blue", linetype="dashed", size=1) +
+  ggtitle("Total Purchases Distribution (excl. 0)") +
+  theme(plot.title = element_text(hjust=0.5))
+tphist
+```
+
+# ITEM BASED COLLABORATIVE FILTERING (I-BCF)
+
+Within collaborative filtering, there are different ways to approach the problem. We will try two different methods.
+The first we will cover is the Item-based CF, then we will User-based CF. We will elaborate more on the differences between these two in the following paragrahs.
+
+First of all, we remove some of the sparse data that is hindering our model's predictive ability, e.g. users and SKUs that have very low quantities.
+```{r}
+delete <- c()
+for(i in 1:dim(train_vcuinformation)[1]){
+  if(sum(train_vcuinformation [i, 11:70]) == 0){
+    delete <- c(delete, i)
+  }
+}
+train_vcuinformation <- train_vcuinformation [-delete, ]
+
+delete_col <- c()
+for(i in 11:70){
+  if(sum(train_vcuinformation [, i]) == 0){
+    delete_col <- c(delete_col, i)
+  }
+}
+train_vcuinformation  <- train_vcuinformation[, -delete_col]
+train_vcuinformation <- (train_vcuinformation[, !(names(train_vcuinformation) %in% c('X20', 'X25'))])
+
+head(train_vcuinformation)
+```
+
+More specifically, in item-based collaborative filtering we are not concerned about the users, so we can disregard the user column of our dataframe. We will drop it using the following code:
+
+```{r}
+single_customer_purchase_information <- rowsum(train_vcuinformation[,11:dim(train_vcuinformation)[2]],train_vcuinformation$user_ID)
+names(single_customer_purchase_information) <- names(train_vcuinformation)[11:dim(train_vcuinformation)[2]]
+```
+
+The next step is to build a function that will help us determine the association relationships between different SKUs.
+The function we use for this section is the Cosine Similarity. Essentially, cosine similarity takes the sum product of two attributes and divides it by the product of the square root of the sum of squares of each individual attribute. The output represents how similar an attribute is to another attribute. Values can range from [a,b] where a denotes X, and b denotes Y.
+
+```{r}
+getCosine <- function(x,y){
+  this.cosine <- sum(x*y) / (sqrt(sum(x*x)) * sqrt(sum(y*y)))
+  return(this.cosine)
+}
+```
+
+We are ready to compare the items, but we need to create a placeholder object to store the values of similarities. The placeholder will be filled in with values of similarities between items; hence it will be a diagonal matrix with items as rows, as well as the columns.
+
+```{r}
+vcuinformation_similarity <- matrix(NA,nrow=ncol(single_customer_purchase_information),ncol=ncol(single_customer_purchase_information),dimnames=list(colnames(single_customer_purchase_information),colnames(single_customer_purchase_information)))
+```
+
+Looping through the columns we compute the similarities using the helper function previously defined:
+
+```{r}
+# Lets fill in those empty spaces with cosine similarities
+# Loop through the columns
+for(i in 1:ncol(single_customer_purchase_information)) {
+  # Loop through the columns for each column
+  for(j in 1:ncol(single_customer_purchase_information)) {
+    # Fill in placeholder with cosine similarities
+    vcuinformation_similarity[i,j] <- getCosine(as.matrix(single_customer_purchase_information[i]),as.matrix(single_customer_purchase_information[j]))
+  }
+}
+ 
+# Back to dataframe
+vcuinformation_similarity <- as.data.frame(vcuinformation_similarity)
+```
+
+Now that we have our similarity matrix, we want to make recommendations. We can do this by looking at the top K most similar SKUs for any given SKU. Again we create a placeholder object, and proceed to fill it in:
+```{r}
+vcuinformation_neighbours <- matrix(NA, nrow=ncol(vcuinformation_similarity),ncol=11,dimnames=list(colnames(vcuinformation_similarity)))
+```
+
+We loop to find the neighbouring skus:
+```{r}
+for(i in 1:ncol(single_customer_purchase_information)) {
+  vcuinformation_neighbours[i,] <- (t(head(n=11,rownames(vcuinformation_similarity[order(vcuinformation_similarity[,i],decreasing=TRUE),][i]))))
+}
+```
+
+The output of Iten-based CF model is a table with SKUs and their most similar neighbours in order:
+```{r}
+vcuinformation_neighbours <- vcuinformation_neighbours[, -1]
+head(vcuinformation_neighbours)
+```
+
+## USER BASED COLLABORATIVE FILTERING (U-BCF)
+
+The second approach we can take towards collaborative filtering is one focused on the similarities between users.
+```{r}
+ID <- row.names(single_customer_purchase_information)
+vcuinformation_df <- cbind(ID,single_customer_purchase_information)
+head(vcuinformation_df)
+```
+
+For this approach, we want to construct a score matrix, and we will follow a very similar process to the one in I-BCF.
+The steps are as follows:
+-Pick an sku, and check whether a given customer has purchased the item
+-Get that item's top K neighbours similarities
+-Get the consumption record of customer for those K neighbour items.
+-Compute the relative score for the user and those neighbouring items by means of: sumproduct(purchaseHistory, similarities)/sum(similarities)
+
+Starting with the score computation part, we create a new helper function for this calculation:
+```{r}
+# Lets make a helper function to calculate the scores
+getScore <- function(history, similarities) {
+  x <- sum(history*similarities)/sum(similarities)
+  x
+}
+```
+
+Placeholder matrix follows:
+```{r}
+holder <- matrix(NA, nrow=nrow(vcuinformation_df),ncol=ncol(vcuinformation_df)-1,dimnames=list((vcuinformation_df$ID),colnames(vcuinformation_df[-1])))
+dim(holder) # row-users, col-items 
+```
+
+Next, we must loop through the dataframe and calculate the quantities that will be inputs to our score function.
+The loop starts by taking each row (user) and then jumps into another loop that takes each column (SKUS). We then store the user’s ID and corresponding SKU purchases in variables that will be used later. We then apply an if statement to filter out SKUs that a user has already purchased.
+```{r}
+# Loop through the IDs (rows)
+   for(i in 1:nrow(holder)) 
+   {
+       # Loops through the products (columns)
+       for(j in 1:ncol(holder)) 
+       {
+           # Get the ID's name and th product's name
+           # We do this not to conform with vectors sorted differently 
+             ID <- rownames(holder)[i]
+             product <- colnames(holder)[j]
+ 
+           # We do not want to recommend products you have already consumed
+           # If you have already consumed it, we store an empty string
+             if(as.integer(vcuinformation_df[vcuinformation_df$ID==ID,product]) == 1)
+             { 
+                 holder[i,j]<-""
+              } else {
+ 
+           # We first have to get a product's top 10 neighbours sorted by similarity
+             topN<-((head(n=11,(vcuinformation_similarity[order(vcuinformation_similarity[,product],decreasing=TRUE),][product]))))
+             topN.names <- as.character(rownames(topN))
+             topN.similarities <- as.numeric(topN[,1])
+ 
+           # Drop the first one because it will always be the same song
+             topN.similarities<-topN.similarities[-1]
+             topN.names<-topN.names[-1]
+ 
+           # We then get the ID's purchase history for those 10 items
+             topN.purchases<- vcuinformation_df[,c("ID",topN.names)]
+             topN.IDPurchases <-topN.purchases[topN.purchases$ID==ID,]
+             topN.IDPurchases <- as.numeric(topN.IDPurchases[!(names(topN.IDPurchases) %in% c("ID"))])
+ 
+            # We then calculate the score for that product and that ID
+             holder[i,j]<-getScore(similarities=topN.similarities, history=topN.IDPurchases)
+ 
+         } # close else statement
+       } # end product for loop   
+   } # end ID for loop
+
+vcuinformation_df_ID_scores <- holder
+head(vcuinformation_df_ID_scores)
+
+dt = as.data.frame(vcuinformation_df_ID_scores)
+user_ID = row.names(vcuinformation_df_ID_scores)
+dt = cbind(user_ID, dt)
+# dt
+
+# vcuinformation_df_ID_scores[1:5,]
+# write.csv(vcuinformation_df_ID_scores[1:5,],"/Users/stefanozavagli/Documents/Carrera/Schools/Berkeley/Clases/SPRING '20/IEOR 242/Project/Images/filo.csv", row.names = TRUE)
+```
+
+We can now get the similarity score for each sku under consideration:
+
+The number K of neighbours that we pick will influence significantly the end results.
+When storing the values, the first column can be dropped if we do not wish to recommend the same item again the the customer. This is however a business case choice.
+
+```{r}
+single_customer_purchase_information_test <- rowsum(test_vcuinformation[,11:70],test_vcuinformation$user_ID)
+# single_customer_purchase_information_test
+```
+
+```{r}
+accuracy_function <- function(n,vcuinformation_df_ID_scores_holder,single_customer_purchase_information) {
+    cpt <- 0
+  for(i in 1:nrow(single_customer_purchase_information)){
+    if (sum(single_customer_purchase_information[i,])==0){
+      cpt <- cpt + 1
+    }
+  }
+  index <- row.names(vcuinformation_df_ID_scores_holder)
+  corr <- 0
+  for (i in index) {
+    if (sum(single_customer_purchase_information_test[i,])>0){
+    for (j in 1:n){
+      produ <- vcuinformation_df_ID_scores_holder[i,j]
+      if (single_customer_purchase_information[i,produ]> 0) {
+        corr <- corr + 1
+        break
+      }
+    }
+    }
+  }
+  ACC = 100*corr/(nrow(vcuinformation_df_ID_scores_holder)-cpt)
+  return(ACC)
+}
+
+```
+
+
+```{r}
+cpt <- 0
+for(i in 1:nrow(single_customer_purchase_information_test)){
+  if (sum(single_customer_purchase_information_test[i,])==0){
+    cpt <- cpt + 1
+  }
+}
+cpt
+```
+
+Lets calculate the accuracies for the recommendations we're making and 
+```{r}
+N = 50
+ACC = c()
+for (i in 1:N) {
+  number_recommandation = i   # Number of recommended product you want to obtain
+  # Lets make our recommendations pretty
+  vcuinformation_df_ID_scores_holder <- matrix(NA, nrow=nrow(vcuinformation_df_ID_scores),ncol=number_recommandation,dimnames=list(rownames(vcuinformation_df_ID_scores)))
+  for(j in 1:nrow(vcuinformation_df_ID_scores)) {
+    vcuinformation_df_ID_scores_holder[j,] <- names(head(n=number_recommandation,(vcuinformation_df_ID_scores[,order(vcuinformation_df_ID_scores[j,],decreasing=TRUE)])[j,]))
+  }
+  
+  ACC[i] = accuracy_function(i,vcuinformation_df_ID_scores_holder,single_customer_purchase_information_test)
+  # if (i <= 5){
+  #   print(head(vcuinformation_df_ID_scores_holder))
+  # }
+  # print(ACC[i])
+}
+```
+
+Now les visualize in tabular form some of the results using a variable number of recommendations
+```{r}
+dt = as.data.frame(vcuinformation_df_ID_scores_holder)
+user_ID = row.names(vcuinformation_df_ID_scores_holder)
+dt = cbind(user_ID, dt)
+head(dt)
+# sprintf("Percent Accuracy for %s recommendations is: %s", i, ACC[i])
+```
+
+```{r}
+xaxis <- seq(1,50)
+ACC
+dat <- as.data.frame(xaxis)
+dat[2] <- as.data.frame(ACC)
+names(dat)[1] = "xaxis"
+names(dat)[2] = "ACC"
+
+benchmark<- as.data.frame(seq(1,50))
+benchmark[2] <- as.data.frame(seq(from = 2, to = 100, by = 2))
+names(benchmark)[1] = "x"
+names(benchmark)[2] = "AC"
+
+accuracy_plot = ggplot(data = dat, aes(x = xaxis, y = ACC)) +
+  geom_point(aes(color = ACC)) +
+  geom_line(data = benchmark, aes(x = x, y = AC), color = "red",linetype='dashed') +
+  xlab("# recommendations") +
+  ylab("Accuracy [%]") +
+  ggtitle("Accuracy vs Number of Recommendations") +
+  theme(plot.title = element_text(hjust=0.5)) 
+accuracy_plot
+```
+
+
+
+```{r}
+# Transform vcuinformation_df_ID_scores_holder into continuous data
+df = as.data.frame(vcuinformation_df_ID_scores_holder)
+user_ID = row.names(vcuinformation_df_ID_scores_holder)
+dat = cbind(user_ID, df)
+dat$user_ID = as.numeric(seq(1, length(dat$user_ID)))
+
+dat_del = dat
+for(i in 2:dim(dat_del)[2]) {
+  dat_del[,i] = as.character(dat_del[,i])
+  dat_del[,i]  = sub(".", "", dat_del[,i])
+  dat_del[,i]  = as.integer(dat_del[,i])
+}
+
+# colored scatterplot 
+ggplot(data = dat, aes(x = user_ID, y = V1)) +
+  geom_point(aes(color = V1))
+```
+
